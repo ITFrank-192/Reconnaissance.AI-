@@ -113,3 +113,188 @@ def resolve_domain(domain: str):
         return {"domain": domain, "ip": ip}
     except Exception as e:
         return {"domain": domain, "error": str(e)}
+from passlib.context import CryptContext
+from jose import jwt
+from datetime import datetime, timedelta
+from app.config import settings
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def hash_password(password: str):
+    return pwd_context.hash(password)
+
+def verify_password(password: str, hashed: str):
+    return pwd_context.verify(password, hashed)
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(hours=12)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm="HS256")
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from app.database import SessionLocal
+from app.schemas.auth import RegisterRequest, LoginRequest
+from app.models.user import User
+from app.services.auth_service import hash_password, verify_password, create_access_token
+
+router = APIRouter()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+@router.post("/register")
+def register(data: RegisterRequest, db: Session = Depends(get_db)):
+    user = User(email=data.email, hashed_password=hash_password(data.password))
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return {"message": "User created"}
+
+@router.post("/login")
+def login(data: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == data.email).first()
+    if not user or not verify_password(data.password, user.hashed_password):
+        raise HTTPException(status_code=400, detail="Invalid credentials")
+
+    token = create_access_token({"sub": user.email})
+    return {"access_token": token}
+from app.models.scan import ScanJob
+from app.workers.tasks import resolve_domain
+
+def create_scan(db, domain: str, org_id: int):
+    scan = ScanJob(domain=domain, org_id=org_id)
+    db.add(scan)
+    db.commit()
+    db.refresh(scan)
+
+    resolve_domain.delay(domain)
+
+    return scan
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+from app.database import SessionLocal
+from app.schemas.scan import ScanCreate
+from app.services.scan_service import create_scan
+
+router = APIRouter()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+@router.post("/")
+def start_scan(data: ScanCreate, db: Session = Depends(get_db)):
+    scan = create_scan(db, data.domain, org_id=1)
+    return {"scan_id": scan.id, "status": scan.status}
+def calculate_risk(open_ports: list):
+    score = 0
+    if 22 in open_ports:
+        score += 30
+    if 3389 in open_ports:
+        score += 40
+    if 3306 in open_ports:
+        score += 50
+    return min(score, 100)
+FROM python:3.11
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+version: "3.9"
+
+services:
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - redis
+
+  worker:
+    build: .
+    command: celery -A app.workers.celery_app.celery worker --loglevel=info
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - db
+
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: antigravity
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run basic lint
+        run: |
+          pip install flake8
+          flake8 .
+# Antigravity
+
+Antigravity is a cloud-native attack surface discovery platform built for startup security teams.
+
+## Stack
+- FastAPI
+- PostgreSQL
+- Redis
+- Celery
+- Docker
+- Stripe-ready
+
+## Run Locally
+
+cp .env.example .env  
+docker-compose up --build  
+
+API: http://localhost:8000  
+Docs: http://localhost:8000/docs  
