@@ -1,0 +1,115 @@
+Frontend (Next.js)
+        |
+    FastAPI
+        |
+  -----------------
+  |               |
+Postgres       Redis
+                  |
+              Celery Workers
+                  |
+             Scan Engine
+antigravity-api/
+│
+├── app/
+│   ├── main.py
+│   ├── config.py
+│   ├── database.py
+│   ├── models/
+│   ├── schemas/
+│   ├── services/
+│   ├── routes/
+│   ├── workers/
+│   └── core/
+│
+├── alembic/
+├── requirements.txt
+└── docker-compose.yml
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+pydantic
+python-jose
+passlib[bcrypt]
+celery
+redis
+python-dotenv
+stripe
+reportlab
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class Settings:
+    DATABASE_URL: str = os.getenv("DATABASE_URL")
+    REDIS_URL: str = os.getenv("REDIS_URL")
+    SECRET_KEY: str = os.getenv("SECRET_KEY")
+    STRIPE_SECRET_KEY: str = os.getenv("STRIPE_SECRET_KEY")
+
+settings = Settings()
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from app.config import settings
+
+engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+Base = declarative_base()
+from fastapi import FastAPI
+from app.routes import auth, scans
+
+app = FastAPI(title="Antigravity API")
+
+app.include_router(auth.router, prefix="/auth", tags=["Auth"])
+app.include_router(scans.router, prefix="/scans", tags=["Scans"])
+
+@app.get("/")
+def health():
+    return {"status": "ok"}
+from sqlalchemy import Column, Integer, String, ForeignKey
+from sqlalchemy.orm import relationship
+from app.database import Base
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True)
+    hashed_password = Column(String)
+    role = Column(String, default="analyst")
+    org_id = Column(Integer, ForeignKey("organizations.id"))
+
+    organization = relationship("Organization", back_populates="users")
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
+from sqlalchemy.sql import func
+from app.database import Base
+
+class ScanJob(Base):
+    __tablename__ = "scan_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    domain = Column(String, index=True)
+    status = Column(String, default="pending")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    org_id = Column(Integer, ForeignKey("organizations.id"))
+from celery import Celery
+from app.config import settings
+
+celery = Celery(
+    "antigravity",
+    broker=settings.REDIS_URL,
+    backend=settings.REDIS_URL
+)
+from app.workers.celery_app import celery
+import socket
+
+@celery.task
+def resolve_domain(domain: str):
+    try:
+        ip = socket.gethostbyname(domain)
+        return {"domain": domain, "ip": ip}
+    except Exception as e:
+        return {"domain": domain, "error": str(e)}
